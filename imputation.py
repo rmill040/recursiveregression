@@ -3,7 +3,8 @@ from __future__ import division, print_function
 from collections import namedtuple
 import numpy as np
 import pandas as pd
-from scipy.stats import mode
+from scipy.stats import mode, t
+import statsmodels.api as sm
 
 from rr import *
 
@@ -14,7 +15,7 @@ CATEGORICAL_DTYPES = ['object', 'category']
 #   - Reinstantiate models during imputation iterations
 #   - Test categorical data analysis
 #   - Add plotting features
-#   - Add functionality to apply models to all data sets
+#   - Test functionality to apply models to all data sets
 
 
 class Imputer(object):
@@ -46,7 +47,7 @@ class Imputer(object):
         Instance of Imputer class
     """
     def __init__(self, M = None, max_its = 10, imputers = None, missing_values = None, initial_fill = 'random',
-                 verbose = False):
+                 alpha = .05, verbose = False):
         
         # Define attributes and data structures
         _valid_initial_fill = ['random', 'mean', 'median']
@@ -66,6 +67,13 @@ class Imputer(object):
                                                     (initial_fill, _valid_initial_fill))
         else:
             self.initial_fill = initial_fill
+
+        if alpha <= 0:
+            raise ValueError("alpha (%.2f) should be greater than 0" % alpha)
+        elif alpha >= 1:
+            raise ValueError("alpha (%.2f) should be less than 1" % alpha)
+        else:
+            self.alpha = alpha
 
         self.M = M
         self.max_its = max_its
@@ -216,6 +224,7 @@ class Imputer(object):
             Array of dependent variable based on observed data
         """
         # Indices for data preparation
+        self.N = data.shape[0]
         o_id = self.missing_summary[label_col].o_id
         m_id = self.missing_summary[label_col].m_id
         other_cols = [data.columns[i] for i in range(data.shape[1]) if data.columns[i] != label_col]
@@ -278,25 +287,117 @@ class Imputer(object):
         return mi_data
 
 
-    def apply(self, mi_data = None, func = None, label_col = None):
-        """Applies func() to all imputed data sets in mi_data
+    @staticmethod
+    def apply(mi_data = None, func = None, label_col = None):
+        """Applies a function handle to all imputed data sets in mi_data
 
         Parameters
         ----------
         mi_data : list
             List of imputed data sets
 
-        func : function
-            Function that takes in a pandas data frame
+        func : function handle
+            Function that takes in a pandas data frame with positional arguments (X, y),
+            where X are the features or covariates and y is the label or response
+
+        label_col : str
+            Name of column used as label or response in pandas data frame
+
+        Returns
+        -------
+        results : list
+            List of estimates specified by return argument of function handle func()
+        """
+        results = []
+        feature_cols = [mi_data[0].columns[i] for i in range(mi_data[0].shape[1]) if mi_data[0].columns[i] != label_col]
+        for i in range(len(mi_data)):
+            results.append(func(mi_data[i][feature_cols], mi_data[i][label_col], data = data))
+        return results
+
+
+    @staticmethod
+    def _linear_reg(X = None, y = None, data = None):
+        """Apply statsmodels linear regression to imputed data sets and return coefficients and 
+           standard errors
+
+        Parameters
+        ----------
+        X : ADD
+            ADD
+
+        y : ADD
+            ADD
 
         Returns
         -------
         """
-        results = []
-        other_cols = [mi_data[0].columns[i] for i in range(mi_data[0].shape[1]) if mi_data[0].columns[i] != label_col]
-        for i in range(len(mi_data)):
-            results.append(func(mi_data[i][other_cols], mi_data[i][label_col]))
-        return results
+        # Vector of ones for intercept
+        n, p = data.shape
+        ones = np.ones((n, 1))
+
+        # Estimate model, get parameters and variances
+        clf = sm.GLM(y, np.hstack((ones, X.values.reshape(n, p - 1))), family = sm.families.Gaussian())
+        params = clf.fit().params
+        variances = np.diag(-np.linalg.inv(clf.information(params)))
+
+        return (params, variances)
+
+
+    def pool(self, Qstar = None, U = None, df = None):
+        """Pooling phase for aggregating multiple imputation estimates
+
+        Parameters
+        ----------
+        Qstar : 1d array-like
+            Array of point estimates 
+
+        U : 1d array-like
+            Array of variance estimates
+
+        df : int
+            Degrees of freedom for model used in estimation
+
+        Returns
+        -------
+        estimates : dict
+            Dictionary of multiple imputation estimates
+        """
+        # Average point estimate
+        Qbar = np.nanmean(Qstar)
+
+        # Within-imputation variance, between-imputation variance, total variance estimates
+        Ubar = np.nanmean(U)
+        Bm = np.nanvar(Qstar)
+        Tm = Ubar + (1 + 1/self.M)*Bm
+        
+        # Relative increase in variance due to nonresponse
+        r = (1 + (1/self.M))*Bm/Ubar
+        
+        # Unadjusted degrees of freedom
+        df_unadj = (self.M - 1) * (1 + (1/r))**2
+
+        # Adjusted degrees of freedom
+        lambda_est = (Bm + Bm/self.M)/Tm
+        df_adj = ((df + 1)/(df + 3))*df*(1 - lambda_est)
+        
+        # Fraction of missing information
+        fmi = (r + 2/(df_unadj + 3))/(r + 1)
+
+        # Confidence intervals
+        se = np.sqrt(Tm)
+        ll, ul = Qbar + t.ppf(self.alpha/2., df_adj)*se, Qbar + t.ppf(1 - self.alpha/2., df_adj)*se
+
+        # Update dictionary
+        estimates = {}
+        estimates['point'] = Qbar
+        estimates['se'] = se
+        estimates['r'] = r
+        estimates['df_adj'] = df_adj
+        estimates['ll'] = ll
+        estimates['ul'] = ul
+        estimates['fmi'] = fmi
+
+        return estimates
 
 
 if __name__ == "__main__":
@@ -310,5 +411,9 @@ if __name__ == "__main__":
     regressor = RecursiveRegressor(verbose = False, min_samples_leaf = 10)
     imputers = {'categorical': None, 'continuous': regressor}
 
-    clf = Imputer(M = 20, max_its = 10, verbose = True, imputers = imputers, missing_values = missing_values, initial_fill = 'median')
-    clf.impute(data)
+    clf = Imputer(M = 5, max_its = 5, verbose = True, imputers = imputers, missing_values = missing_values, initial_fill = 'median')
+    mi_data = clf.impute(data)
+    #[print(np.mean(dat, axis = 0)) for dat in mi_data]
+    import pdb
+    pdb.set_trace()
+    estimates = clf.apply(mi_data = mi_data, func = Imputer._linear_reg, label_col = 'y')
