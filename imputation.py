@@ -12,10 +12,9 @@ from rr import *
 CATEGORICAL_DTYPES = ['object', 'category']
 
 # TODO:
-#   - Reinstantiate models during imputation iterations
 #   - Test categorical data analysis
 #   - Add plotting features
-#   - Test functionality to apply models to all data sets
+#   - Unit tests
 
 
 class Imputer(object):
@@ -237,7 +236,7 @@ class Imputer(object):
         return X_obs, X_mis, y_obs
 
 
-    def impute(self, data = None):
+    def impute(self, data = None, func_name = None):
         """Multiple imputation using fully conditional specification
 
         Parameters
@@ -245,13 +244,23 @@ class Imputer(object):
         data : pandas DataFrame
             Data frame with missing value
 
+        func_name : str 
+            Name of function call for predicting missing values
+
         Returns
         -------
         mi_data : list
             List of imputed data sets
         """
+        # Error checking
         assert(isinstance(data, pd.DataFrame)), "data is type %s, needs to be pandas DataFrame" % (type(data))
+        assert(func_name), "func_name not specified, see documentation"
+        if self.imputers['continuous']:
+            assert(hasattr(self.imputers['continuous'], func_name)), "continuous imputer does not have %s method" % func_name
+        if self.imputers['categorical']:
+            assert(hasattr(self.imputers['categorical'], func_name)), "categorical imputer does not have %s method" % func_name
         
+        # Start imputation scheme
         mi_data = []
         for m in range(self.M):
 
@@ -274,10 +283,10 @@ class Imputer(object):
 
                     if str(data_m.dtypes[name]) in CATEGORICAL_DTYPES:
                         self.imputers['categorical'].fit(X = X_obs, y = y_obs)
-                        data_m[name].ix[self.missing_summary[name].m_id] = self.imputers['categorical'].sample(X_mis.values)
+                        data_m[name].ix[self.missing_summary[name].m_id] = eval("""self.imputers['categorical'].{method}(X_mis.values)""".format(method = func_name))
                     else:
                         self.imputers['continuous'].fit(X = X_obs, y = y_obs)
-                        data_m[name].ix[self.missing_summary[name].m_id] = self.imputers['continuous'].sample(X_mis.values)
+                        data_m[name].ix[self.missing_summary[name].m_id] = eval("""self.imputers['continuous'].{method}(X_mis.values)""".format(method = func_name))
 
                 counter += 1
 
@@ -311,36 +320,41 @@ class Imputer(object):
         results = []
         feature_cols = [mi_data[0].columns[i] for i in range(mi_data[0].shape[1]) if mi_data[0].columns[i] != label_col]
         for i in range(len(mi_data)):
-            results.append(func(mi_data[i][feature_cols], mi_data[i][label_col], data = data))
+            results.append(func(mi_data[i][feature_cols], mi_data[i][label_col]))
         return results
 
 
     @staticmethod
-    def _linear_reg(X = None, y = None, data = None):
+    def _linear_reg(X = None, y = None, fit_intercept = True):
         """Apply statsmodels linear regression to imputed data sets and return coefficients and 
-           standard errors
+           variances
 
         Parameters
         ----------
-        X : ADD
-            ADD
+        X : 2d array-like
+            Feature matrix
 
-        y : ADD
-            ADD
+        y : 1d array-like
+            Labels or response
 
         Returns
         -------
         """
-        # Vector of ones for intercept
-        n, p = data.shape
-        ones = np.ones((n, 1))
+        n = X.shape[0]
+        if isinstance(X, pd.core.frame.DataFrame):
+            X = X.values
+
+        # Add vector of ones for intercept
+        if fit_intercept:
+            ones = np.ones((n, 1))
+            X = np.hstack((ones, X))
 
         # Estimate model, get parameters and variances
-        clf = sm.GLM(y, np.hstack((ones, X.values.reshape(n, p - 1))), family = sm.families.Gaussian())
+        clf = sm.GLM(y, X, family = sm.families.Gaussian())
         params = clf.fit().params
         variances = np.diag(-np.linalg.inv(clf.information(params)))
 
-        return (params, variances)
+        return (np.asarray(params), np.asarray(variances))
 
 
     def pool(self, Qstar = None, U = None, df = None):
@@ -363,11 +377,11 @@ class Imputer(object):
             Dictionary of multiple imputation estimates
         """
         # Average point estimate
-        Qbar = np.nanmean(Qstar)
+        Qbar = np.mean(Qstar, axis = 0)
 
         # Within-imputation variance, between-imputation variance, total variance estimates
-        Ubar = np.nanmean(U)
-        Bm = np.nanvar(Qstar)
+        Ubar = np.mean(U, axis = 0)
+        Bm = np.var(Qstar, axis = 0)
         Tm = Ubar + (1 + 1/self.M)*Bm
         
         # Relative increase in variance due to nonresponse
@@ -401,19 +415,47 @@ class Imputer(object):
 
 
 if __name__ == "__main__":
-    data = pd.DataFrame(np.random.normal(0, 1, (50, 3)), columns = ['x', 'y', 'z'])
+
+    ## EXAMPLE PIPELINE ##
+    
+    # Simulate small data set
+    N, M = 50, 5
+    df = N - 4
+    data = pd.DataFrame(np.random.normal(0, 1, (N, 3)), columns = ['x', 'y', 'z'])
+    
+    # Create missing values with different indicators
     data.ix[1:7, 0] = -999
     data.ix[1:2, 1] = -777
     data.ix[7:8, 2] = -666
     missing_values = [-666, -777, -999]
 
-    classifier = RecursiveClassifier(verbose = False, min_samples_leaf = 30)
+    # Define imputers for continuous and categorical variables
+    classifier = RecursiveClassifier(verbose = False, min_samples_leaf = 30) # Not used for shown for example
     regressor = RecursiveRegressor(verbose = False, min_samples_leaf = 10)
     imputers = {'categorical': None, 'continuous': regressor}
 
-    clf = Imputer(M = 5, max_its = 5, verbose = True, imputers = imputers, missing_values = missing_values, initial_fill = 'median')
-    mi_data = clf.impute(data)
-    #[print(np.mean(dat, axis = 0)) for dat in mi_data]
-    import pdb
-    pdb.set_trace()
-    estimates = clf.apply(mi_data = mi_data, func = Imputer._linear_reg, label_col = 'y')
+    # Define imputation model
+    clf = Imputer(M = M, 
+                  max_its = 10, 
+                  verbose = True, 
+                  imputers = imputers, 
+                  missing_values = missing_values, 
+                  initial_fill = 'random')
+
+    # Multiply impute data
+    mi_data = clf.impute(data, func_name = 'sample')
+
+    # Apply function to each imputed data set
+    mi_estimates = clf.apply(mi_data = mi_data, func = Imputer._linear_reg, label_col = 'y')
+
+    # Pool results to obtain multiply imputed estimates
+    pooled_estimates = clf.pool(Qstar = [mi_estimates[i][0] for i in range(M)], 
+                                U = [mi_estimates[i][1] for i in range(M)], 
+                                df = df)
+
+    # Display results (lazy formatting!)
+    print('\n')
+    print('{:<10}{:^40}'.format('Estimate', 'Value'))
+    print('-'*50)
+    for key, value in pooled_estimates.iteritems():
+        print('{:<10}{:^40}'.format(key, value))
