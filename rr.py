@@ -695,7 +695,7 @@ class RecursiveRegressor(BaseRecursiveModel):
 
 if __name__ == "__main__":
 
-    linear = False
+    linear = True
     logistic = True
 
     if linear:
